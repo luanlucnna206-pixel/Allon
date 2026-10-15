@@ -1,0 +1,389 @@
+name: Build APK
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Gerar arquivos do app
+        run: |
+          rm -rf app
+          mkdir -p app/src/main/java/com/estoque
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "EstoqueVendas"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.estoque"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.estoque"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="Estoque e Vendas"
+                  android:allowBackup="false"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/estoque/MainActivity.kt <<'EOF'
+          package com.estoque
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.ContentValues
+          import android.content.Context
+          import android.content.Intent
+          import android.database.Cursor
+          import android.database.DatabaseUtils
+          import android.database.sqlite.SQLiteDatabase
+          import android.database.sqlite.SQLiteOpenHelper
+          import android.graphics.Typeface
+          import android.net.Uri
+          import android.os.Bundle
+          import android.text.InputType
+          import android.view.Gravity
+          import android.view.ViewGroup
+          import android.widget.*
+          import org.json.JSONArray
+          import org.json.JSONException
+          import org.json.JSONObject
+          import java.math.BigDecimal
+          import java.math.RoundingMode
+          import java.text.SimpleDateFormat
+          import java.util.*
+
+          // ====================== MODELOS ======================
+          class Produto(val id: Long, val nome: String, val precoCent: Long, val quantidade: Int)
+          class VendaResumo(val id: Long, val data: Long, val total: Long, val itens: String)
+          class Mov(val id: Long, val nome: String, val tipo: String, val qtd: Int, val data: Long, val obs: String)
+          class EstoqueException(msg: String) : Exception(msg)
+          class BackupException(msg: String) : Exception(msg)
+          class Dados(
+              val exportadoEm: Long,
+              val produtos: List<JSONObject>,
+              val vendas: List<JSONObject>,
+              val itens: List<JSONObject>,
+              val movs: List<JSONObject>
+          )
+
+          // ====================== BANCO (SQLite) ======================
+          class Db(ctx: Context) : SQLiteOpenHelper(ctx, "estoque.db", null, 1) {
+
+              override fun onCreate(db: SQLiteDatabase) {
+                  db.execSQL("CREATE TABLE produtos(id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT NOT NULL, preco_cent INTEGER NOT NULL, quantidade INTEGER NOT NULL CHECK(quantidade >= 0))")
+                  db.execSQL("CREATE TABLE vendas(id INTEGER PRIMARY KEY AUTOINCREMENT, data INTEGER NOT NULL, total_cent INTEGER NOT NULL)")
+                  db.execSQL("CREATE TABLE itens_venda(id INTEGER PRIMARY KEY AUTOINCREMENT, venda_id INTEGER NOT NULL, produto_id INTEGER NOT NULL, nome TEXT NOT NULL, quantidade INTEGER NOT NULL, preco_cent INTEGER NOT NULL)")
+                  db.execSQL("CREATE TABLE movimentacoes(id INTEGER PRIMARY KEY AUTOINCREMENT, produto_id INTEGER NOT NULL, nome TEXT NOT NULL, tipo TEXT NOT NULL, quantidade INTEGER NOT NULL, data INTEGER NOT NULL, obs TEXT NOT NULL)")
+              }
+
+              override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {}
+
+              fun contar(tabela: String): Long = DatabaseUtils.queryNumEntries(readableDatabase, tabela)
+
+              private fun mov(db: SQLiteDatabase, pid: Long, nome: String, tipo: String, qtd: Int, obs: String) {
+                  val cv = ContentValues()
+                  cv.put("produto_id", pid)
+                  cv.put("nome", nome)
+                  cv.put("tipo", tipo)
+                  cv.put("quantidade", qtd)
+                  cv.put("data", System.currentTimeMillis())
+                  cv.put("obs", obs)
+                  db.insertOrThrow("movimentacoes", null, cv)
+              }
+
+              // Produto novo: o estoque inicial entra como movimentação de ENTRADA
+              fun cadastrarProduto(nome: String, precoCent: Long, qtd: Int): Long {
+                  if (nome.isBlank()) throw EstoqueException("Informe o nome do produto.")
+                  if (precoCent < 0) throw EstoqueException("Preço inválido.")
+                  if (qtd < 0) throw EstoqueException("Quantidade inválida.")
+                  val db = writableDatabase
+                  db.beginTransaction()
+                  try {
+                      val cv = ContentValues()
+                      cv.put("nome", nome.trim())
+                      cv.put("preco_cent", precoCent)
+                      cv.put("quantidade", qtd)
+                      val id = db.insertOrThrow("produtos", null, cv)
+                      if (qtd > 0) mov(db, id, nome.trim(), "ENTRADA", qtd, "Cadastro do produto")
+                      db.setTransactionSuccessful()
+                      return id
+                  } finally {
+                      db.endTransaction()
+                  }
+              }
+
+              // Reposição: soma ao estoque e grava ENTRADA
+              fun reporEstoque(produtoId: Long, qtd: Int) {
+                  if (qtd <= 0) throw EstoqueException("A quantidade deve ser maior que zero.")
+                  val db = writableDatabase
+                  db.beginTransaction()
+                  try {
+                      var nome: String? = null
+                      db.rawQuery("SELECT nome FROM produtos WHERE id=?", arrayOf(produtoId.toString())).use { c ->
+                          if (c.moveToFirst()) nome = c.getString(0)
+                      }
+                      val n = nome ?: throw EstoqueException("Produto não encontrado.")
+                      db.execSQL("UPDATE produtos SET quantidade = quantidade + ? WHERE id = ?", arrayOf<Any>(qtd, produtoId))
+                      mov(db, produtoId, n, "ENTRADA", qtd, "Reposição de estoque")
+                      db.setTransactionSuccessful()
+                  } finally {
+                      db.endTransaction()
+                  }
+              }
+
+              // Venda: confere estoque, desconta, grava itens e movimentações. Tudo ou nada.
+              fun registrarVenda(itens: Map<Long, Int>): Long {
+                  if (itens.isEmpty()) throw EstoqueException("Nenhum item na venda.")
+                  val db = writableDatabase
+                  db.beginTransaction()
+                  try {
+                      val cvv = ContentValues()
+                      cvv.put("data", System.currentTimeMillis())
+                      cvv.put("total_cent", 0L)
+                      val vendaId = db.insertOrThrow("vendas", null, cvv)
+                      var total = 0L
+                      for ((pid, q) in itens) {
+                          if (q <= 0) continue
+                          var nome = ""
+                          var preco = 0L
+                          var estoque = 0
+                          var achou = false
+                          db.rawQuery("SELECT nome, preco_cent, quantidade FROM produtos WHERE id=?", arrayOf(pid.toString())).use { c ->
+                              if (c.moveToFirst()) {
+                                  achou = true
+                                  nome = c.getString(0)
+                                  preco = c.getLong(1)
+                                  estoque = c.getInt(2)
+                              }
+                          }
+                          if (!achou) throw EstoqueException("Produto não encontrado.")
+                          if (estoque < q) throw EstoqueException("Estoque insuficiente de \"$nome\": disponível $estoque, pedido $q.")
+                          db.execSQL("UPDATE produtos SET quantidade = quantidade - ? WHERE id = ?", arrayOf<Any>(q, pid))
+                          val cvi = ContentValues()
+                          cvi.put("venda_id", vendaId)
+                          cvi.put("produto_id", pid)
+                          cvi.put("nome", nome)
+                          cvi.put("quantidade", q)
+                          cvi.put("preco_cent", preco)
+                          db.insertOrThrow("itens_venda", null, cvi)
+                          mov(db, pid, nome, "VENDA", q, "Venda nº $vendaId")
+                          total += preco * q
+                      }
+                      if (itens.values.none { it > 0 }) throw EstoqueException("Nenhum item na venda.")
+                      db.execSQL("UPDATE vendas SET total_cent = ? WHERE id = ?", arrayOf<Any>(total, vendaId))
+                      db.setTransactionSuccessful()
+                      return vendaId
+                  } finally {
+                      db.endTransaction()
+                  }
+              }
+
+              fun listarProdutos(): List<Produto> {
+                  val r = ArrayList<Produto>()
+                  readableDatabase.rawQuery("SELECT id, nome, preco_cent, quantidade FROM produtos ORDER BY nome COLLATE NOCASE", null).use { c ->
+                      while (c.moveToNext()) r.add(Produto(c.getLong(0), c.getString(1), c.getLong(2), c.getInt(3)))
+                  }
+                  return r
+              }
+
+              fun listarVendas(limite: Int): List<VendaResumo> {
+                  val r = ArrayList<VendaResumo>()
+                  val db = readableDatabase
+                  db.rawQuery("SELECT id, data, total_cent FROM vendas ORDER BY id DESC LIMIT ?", arrayOf(limite.toString())).use { c ->
+                      while (c.moveToNext()) {
+                          val id = c.getLong(0)
+                          val partes = ArrayList<String>()
+                          db.rawQuery("SELECT quantidade, nome FROM itens_venda WHERE venda_id=? ORDER BY id", arrayOf(id.toString())).use { ci ->
+                              while (ci.moveToNext()) partes.add("${ci.getInt(0)}x ${ci.getString(1)}")
+                          }
+                          r.add(VendaResumo(id, c.getLong(1), c.getLong(2), partes.joinToString(", ")))
+                      }
+                  }
+                  return r
+              }
+
+              fun listarMov(limite: Int): List<Mov> {
+                  val r = ArrayList<Mov>()
+                  readableDatabase.rawQuery("SELECT id, nome, tipo, quantidade, data, obs FROM movimentacoes ORDER BY id DESC LIMIT ?", arrayOf(limite.toString())).use { c ->
+                      while (c.moveToNext()) r.add(Mov(c.getLong(0), c.getString(1), c.getString(2), c.getInt(3), c.getLong(4), c.getString(5)))
+                  }
+                  return r
+              }
+          }
+
+          // ====================== BACKUP (JSON) ======================
+          object Backup {
+              const val FORMATO = "estoque-vendas-backup"
+              const val VERSAO = 1L
+
+              private fun ler(sql: SQLiteDatabase, tabela: String, mapa: List<Pair<String, String>>): JSONArray {
+                  val arr = JSONArray()
+                  val cols = mapa.joinToString(",") { it.first }
+                  sql.rawQuery("SELECT $cols FROM $tabela ORDER BY id", null).use { c ->
+                      while (c.moveToNext()) {
+                          val o = JSONObject()
+                          mapa.forEachIndexed { i, par ->
+                              if (c.getType(i) == Cursor.FIELD_TYPE_INTEGER) o.put(par.second, c.getLong(i))
+                              else o.put(par.second, c.getString(i) ?: "")
+                          }
+                          arr.put(o)
+                      }
+                  }
+                  return arr
+              }
+
+              fun exportar(db: Db): String {
+                  val sql = db.readableDatabase
+                  val raiz = JSONObject()
+                  raiz.put("formato", FORMATO)
+                  raiz.put("versao", VERSAO)
+                  raiz.put("exportadoEm", System.currentTimeMillis())
+                  raiz.put("produtos", ler(sql, "produtos", listOf("id" to "id", "nome" to "nome", "preco_cent" to "precoCent", "quantidade" to "quantidade")))
+                  raiz.put("vendas", ler(sql, "vendas", listOf("id" to "id", "data" to "data", "total_cent" to "totalCent")))
+                  raiz.put("itensVenda", ler(sql, "itens_venda", listOf("id" to "id", "venda_id" to "vendaId", "produto_id" to "produtoId", "nome" to "nome", "quantidade" to "quantidade", "preco_cent" to "precoCent")))
+                  raiz.put("movimentacoes", ler(sql, "movimentacoes", listOf("id" to "id", "produto_id" to "produtoId", "nome" to "nome", "tipo" to "tipo", "quantidade" to "quantidade", "data" to "data", "obs" to "obs")))
+                  return raiz.toString(2)
+              }
+
+              private fun inteiro(o: JSONObject, k: String, ctx: String, min: Long = 0L): Long {
+                  if (!o.has(k) || o.isNull(k)) throw BackupException("$ctx: o campo \"$k\" está ausente.")
+                  val v = o.get(k)
+                  if (v !is Int && v !is Long) throw BackupException("$ctx: o campo \"$k\" deve ser um número inteiro.")
+                  val n = (v as Number).toLong()
+                  if (n < min) throw BackupException("$ctx: o campo \"$k\" tem valor inválido ($n).")
+                  return n
+              }
+
+              private fun texto(o: JSONObject, k: String, ctx: String, obrigatorio: Boolean = true): String {
+                  if (!o.has(k) || o.isNull(k)) throw BackupException("$ctx: o campo \"$k\" está ausente.")
+                  val v = o.get(k)
+                  if (v !is String) throw BackupException("$ctx: o campo \"$k\" deve ser texto.")
+                  if (obrigatorio && v.isBlank()) throw BackupException("$ctx: o campo \"$k\" está vazio.")
+                  return v
+              }
+
+              private fun objetos(raiz: JSONObject, chave: String): List<JSONObject> {
+                  val arr = raiz.optJSONArray(chave) ?: throw BackupException("A seção \"$chave\" não foi encontrada no arquivo.")
+                  val r = ArrayList<JSONObject>()
+                  for (i in 0 until arr.length()) {
+                      r.add(arr.optJSONObject(i) ?: throw BackupException("Seção \"$chave\", item ${i + 1}: formato inválido."))
+                  }
+                  return r
+              }
+
+              // Valida TUDO antes de qualquer alteração no banco
+              fun validar(conteudo: String): Dados {
+                  val raiz = try {
+                      JSONObject(conteudo.trimStart('\uFEFF').trim())
+                  } catch (e: JSONException) {
+                      throw BackupException("O arquivo escolhido não é um backup válido (não foi possível ler o JSON).")
+                  }
+                  if (raiz.optString("formato") != FORMATO) throw BackupException("Este arquivo não é um backup do aplicativo Estoque e Vendas.")
+                  val versao = inteiro(raiz, "versao", "Cabeçalho", 1L)
+                  if (versao > VERSAO) throw BackupException("Este backup foi criado por uma versão mais nova do aplicativo. Atualize o app e tente novamente.")
+                  val exportadoEm = inteiro(raiz, "exportadoEm", "Cabeçalho")
+
+                  val produtos = objetos(raiz, "produtos")
+                  val vendas = objetos(raiz, "vendas")
+                  val itens = objetos(raiz, "itensVenda")
+                  val movs = objetos(raiz, "movimentacoes")
+
+                  val idsProd = HashSet<Long>()
+                  for ((i, o) in produtos.withIndex()) {
+                      val ctx = "Produto ${i + 1}"
+                      if (!idsProd.add(inteiro(o, "id", ctx, 1L))) throw BackupException("$ctx: código repetido.")
+                      texto(o, "nome", ctx)
+                      inteiro(o, "precoCent", ctx)
+                      if (inteiro(o, "quantidade", ctx) > Int.MAX_VALUE) throw BackupException("$ctx: quantidade grande demais.")
+                  }
+                  val idsVenda = HashSet<Long>()
+                  for ((i, o) in vendas.withIndex()) {
+                      val ctx = "Venda ${i + 1}"
+                      if (!idsVenda.add(inteiro(o, "id", ctx, 1L))) throw BackupException("$ctx: código repetido.")
+                      inteiro(o, "data", ctx)
+                      inteiro(o, "totalCent", ctx)
+                  }
+                  val idsItem = HashSet<Long>()
+                  for ((i, o) in itens.withIndex()) {
+                      val ctx = "Item de venda ${i + 1}"
+                      if (!idsItem.add(inteiro(o, "id", ctx, 1L))) throw BackupException("$ctx: código repetido.")
+                      if (inteiro(o, "vendaId", ctx, 1L) !in idsVenda) throw BackupException("$ctx: refere-se a uma venda que não existe no arquivo.")
+                      inteiro(o, "produtoId", ctx, 1L)
+                      texto(o, "nome", ctx)
+                      if (inteiro(o, "quantidade", ctx, 1L) > Int.MAX_VALUE) throw BackupException("$ctx: quantidade grande demais.")
+                      inteiro(o, "precoCent", ctx)
+                  }
+                  val idsMov = HashSet<Long>()
+                  for ((i, o) in movs.withIndex()) {
+                      val ctx = "Movimentação ${i + 1}"
+                      if (!idsMov.add(inteiro(o, "id", ctx, 1L))) throw BackupException("$ctx: código repetido.")
+                      inteiro(o, "produtoId", ctx, 1L)
+                      texto(o, "nome", ctx)
+                      val tipo = texto(o, "tipo", ctx)
+                      if (tipo != "ENTRADA" && tipo != "VENDA") throw BackupException("$ct
