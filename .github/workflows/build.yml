@@ -1,0 +1,1239 @@
+name: Build APK
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Gerar arquivos do app
+        run: |
+          rm -rf app
+          mkdir -p app/src/main/java/com/estoque
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "EstoqueVendas"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.estoque"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.estoque"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 3
+                  versionName = "2.1"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="Estoque e Vendas"
+                  android:icon="@mipmap/ic_launcher"
+                  android:allowBackup="false"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/estoque/MainActivity.kt <<'EOF'
+          package com.estoque
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.ContentValues
+          import android.content.Context
+          import android.content.Intent
+          import android.database.Cursor
+          import android.database.DatabaseUtils
+          import android.database.sqlite.SQLiteDatabase
+          import android.database.sqlite.SQLiteOpenHelper
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.os.Bundle
+          import android.text.Editable
+          import android.text.InputType
+          import android.text.TextWatcher
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.*
+          import org.json.JSONArray
+          import org.json.JSONException
+          import org.json.JSONObject
+          import java.math.BigDecimal
+          import java.math.RoundingMode
+          import java.text.SimpleDateFormat
+          import java.util.*
+
+          // ====================== MODELOS ======================
+          const val LIMITE_BAIXO = 5
+
+          class Produto(val id: Long, val nome: String, val precoCent: Long, val quantidade: Int)
+          class VendaResumo(val id: Long, val data: Long, val total: Long, val itens: String, val pagamento: String)
+          class Mov(val id: Long, val nome: String, val tipo: String, val qtd: Int, val data: Long, val obs: String)
+          class EstoqueException(msg: String) : Exception(msg)
+          class BackupException(msg: String) : Exception(msg)
+          class Dados(
+              val exportadoEm: Long,
+              val produtos: List<JSONObject>,
+              val vendas: List<JSONObject>,
+              val itens: List<JSONObject>,
+              val movs: List<JSONObject>
+          )
+
+          // ====================== BANCO (SQLite) ======================
+          class Db(ctx: Context) : SQLiteOpenHelper(ctx, "estoque.db", null, 2) {
+
+              override fun onCreate(db: SQLiteDatabase) {
+                  db.execSQL("CREATE TABLE produtos(id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT NOT NULL, preco_cent INTEGER NOT NULL, quantidade INTEGER NOT NULL CHECK(quantidade >= 0))")
+                  db.execSQL("CREATE TABLE vendas(id INTEGER PRIMARY KEY AUTOINCREMENT, data INTEGER NOT NULL, total_cent INTEGER NOT NULL, pagamento TEXT NOT NULL DEFAULT 'Dinheiro')")
+                  db.execSQL("CREATE TABLE itens_venda(id INTEGER PRIMARY KEY AUTOINCREMENT, venda_id INTEGER NOT NULL, produto_id INTEGER NOT NULL, nome TEXT NOT NULL, quantidade INTEGER NOT NULL, preco_cent INTEGER NOT NULL)")
+                  db.execSQL("CREATE TABLE movimentacoes(id INTEGER PRIMARY KEY AUTOINCREMENT, produto_id INTEGER NOT NULL, nome TEXT NOT NULL, tipo TEXT NOT NULL, quantidade INTEGER NOT NULL, data INTEGER NOT NULL, obs TEXT NOT NULL)")
+              }
+
+              override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+                  if (oldVersion < 2) db.execSQL("ALTER TABLE vendas ADD COLUMN pagamento TEXT NOT NULL DEFAULT 'Dinheiro'")
+              }
+
+              fun contar(tabela: String): Long = DatabaseUtils.queryNumEntries(readableDatabase, tabela)
+
+              fun contarBaixo(): Long = DatabaseUtils.queryNumEntries(readableDatabase, "produtos", "quantidade <= ?", arrayOf(LIMITE_BAIXO.toString()))
+
+              fun totalItens(): Long {
+                  readableDatabase.rawQuery("SELECT COALESCE(SUM(quantidade),0) FROM produtos", null).use { c ->
+                      if (c.moveToFirst()) return c.getLong(0)
+                  }
+                  return 0L
+              }
+
+              // [quantidade de vendas hoje, total em centavos]
+              fun resumoHoje(): LongArray {
+                  val cal = Calendar.getInstance()
+                  cal.set(Calendar.HOUR_OF_DAY, 0)
+                  cal.set(Calendar.MINUTE, 0)
+                  cal.set(Calendar.SECOND, 0)
+                  cal.set(Calendar.MILLISECOND, 0)
+                  readableDatabase.rawQuery("SELECT COUNT(*), COALESCE(SUM(total_cent),0) FROM vendas WHERE data >= ?", arrayOf(cal.timeInMillis.toString())).use { c ->
+                      if (c.moveToFirst()) return longArrayOf(c.getLong(0), c.getLong(1))
+                  }
+                  return longArrayOf(0L, 0L)
+              }
+
+              private fun mov(db: SQLiteDatabase, pid: Long, nome: String, tipo: String, qtd: Int, obs: String) {
+                  val cv = ContentValues()
+                  cv.put("produto_id", pid)
+                  cv.put("nome", nome)
+                  cv.put("tipo", tipo)
+                  cv.put("quantidade", qtd)
+                  cv.put("data", System.currentTimeMillis())
+                  cv.put("obs", obs)
+                  db.insertOrThrow("movimentacoes", null, cv)
+              }
+
+              // Produto novo: o estoque inicial entra como movimentação de ENTRADA
+              fun cadastrarProduto(nome: String, precoCent: Long, qtd: Int): Long {
+                  if (nome.isBlank()) throw EstoqueException("Informe o nome do produto.")
+                  if (precoCent < 0) throw EstoqueException("Preço inválido.")
+                  if (qtd < 0) throw EstoqueException("Quantidade inválida.")
+                  val db = writableDatabase
+                  db.beginTransaction()
+                  try {
+                      val cv = ContentValues()
+                      cv.put("nome", nome.trim())
+                      cv.put("preco_cent", precoCent)
+                      cv.put("quantidade", qtd)
+                      val id = db.insertOrThrow("produtos", null, cv)
+                      if (qtd > 0) mov(db, id, nome.trim(), "ENTRADA", qtd, "Cadastro do produto")
+                      db.setTransactionSuccessful()
+                      return id
+                  } finally {
+                      db.endTransaction()
+                  }
+              }
+
+              fun editarProduto(id: Long, nome: String, precoCent: Long) {
+                  if (nome.isBlank()) throw EstoqueException("Informe o nome do produto.")
+                  if (precoCent < 0) throw EstoqueException("Preço inválido.")
+                  val cv = ContentValues()
+                  cv.put("nome", nome.trim())
+                  cv.put("preco_cent", precoCent)
+                  val n = writableDatabase.update("produtos", cv, "id=?", arrayOf(id.toString()))
+                  if (n == 0) throw EstoqueException("Produto não encontrado.")
+              }
+
+              fun excluirProduto(id: Long) {
+                  writableDatabase.delete("produtos", "id=?", arrayOf(id.toString()))
+              }
+
+              // Reposição: soma ao estoque e grava ENTRADA
+              fun reporEstoque(produtoId: Long, qtd: Int) {
+                  if (qtd <= 0) throw EstoqueException("A quantidade deve ser maior que zero.")
+                  val db = writableDatabase
+                  db.beginTransaction()
+                  try {
+                      var nome: String? = null
+                      db.rawQuery("SELECT nome FROM produtos WHERE id=?", arrayOf(produtoId.toString())).use { c ->
+                          if (c.moveToFirst()) nome = c.getString(0)
+                      }
+                      val n = nome ?: throw EstoqueException("Produto não encontrado.")
+                      db.execSQL("UPDATE produtos SET quantidade = quantidade + ? WHERE id = ?", arrayOf<Any>(qtd, produtoId))
+                      mov(db, produtoId, n, "ENTRADA", qtd, "Reposição de estoque")
+                      db.setTransactionSuccessful()
+                  } finally {
+                      db.endTransaction()
+                  }
+              }
+
+              // Venda: confere estoque, desconta, grava itens e movimentações. Tudo ou nada.
+              fun registrarVenda(itens: Map<Long, Int>, pagamento: String): Long {
+                  if (itens.isEmpty()) throw EstoqueException("Nenhum item na venda.")
+                  val db = writableDatabase
+                  db.beginTransaction()
+                  try {
+                      val cvv = ContentValues()
+                      cvv.put("data", System.currentTimeMillis())
+                      cvv.put("total_cent", 0L)
+                      cvv.put("pagamento", pagamento)
+                      val vendaId = db.insertOrThrow("vendas", null, cvv)
+                      var total = 0L
+                      for ((pid, q) in itens) {
+                          if (q <= 0) continue
+                          var nome = ""
+                          var preco = 0L
+                          var estoque = 0
+                          var achou = false
+                          db.rawQuery("SELECT nome, preco_cent, quantidade FROM produtos WHERE id=?", arrayOf(pid.toString())).use { c ->
+                              if (c.moveToFirst()) {
+                                  achou = true
+                                  nome = c.getString(0)
+                                  preco = c.getLong(1)
+                                  estoque = c.getInt(2)
+                              }
+                          }
+                          if (!achou) throw EstoqueException("Produto não encontrado.")
+                          if (estoque < q) throw EstoqueException("Estoque insuficiente de \"$nome\": disponível $estoque, pedido $q.")
+                          db.execSQL("UPDATE produtos SET quantidade = quantidade - ? WHERE id = ?", arrayOf<Any>(q, pid))
+                          val cvi = ContentValues()
+                          cvi.put("venda_id", vendaId)
+                          cvi.put("produto_id", pid)
+                          cvi.put("nome", nome)
+                          cvi.put("quantidade", q)
+                          cvi.put("preco_cent", preco)
+                          db.insertOrThrow("itens_venda", null, cvi)
+                          mov(db, pid, nome, "VENDA", q, "Venda nº $vendaId")
+                          total += preco * q
+                      }
+                      if (itens.values.none { it > 0 }) throw EstoqueException("Nenhum item na venda.")
+                      db.execSQL("UPDATE vendas SET total_cent = ? WHERE id = ?", arrayOf<Any>(total, vendaId))
+                      db.setTransactionSuccessful()
+                      return vendaId
+                  } finally {
+                      db.endTransaction()
+                  }
+              }
+
+              // Exclui a venda. Se devolver = true, os itens voltam ao estoque (com registro de ENTRADA).
+              // Retorna quantos itens não puderam voltar (produto já excluído).
+              fun excluirVenda(id: Long, devolver: Boolean): Int {
+                  val db = writableDatabase
+                  db.beginTransaction()
+                  try {
+                      var naoVoltaram = 0
+                      if (devolver) {
+                          val itens = ArrayList<Triple<Long, String, Int>>()
+                          db.rawQuery("SELECT produto_id, nome, quantidade FROM itens_venda WHERE venda_id=?", arrayOf(id.toString())).use { c ->
+                              while (c.moveToNext()) itens.add(Triple(c.getLong(0), c.getString(1), c.getInt(2)))
+                          }
+                          for ((pid, nome, q) in itens) {
+                              val existe = DatabaseUtils.queryNumEntries(db, "produtos", "id=?", arrayOf(pid.toString())) > 0
+                              if (existe) {
+                                  db.execSQL("UPDATE produtos SET quantidade = quantidade + ? WHERE id = ?", arrayOf<Any>(q, pid))
+                                  mov(db, pid, nome, "ENTRADA", q, "Estorno da venda nº $id")
+                              } else {
+                                  naoVoltaram++
+                              }
+                          }
+                      }
+                      db.delete("itens_venda", "venda_id=?", arrayOf(id.toString()))
+                      db.delete("vendas", "id=?", arrayOf(id.toString()))
+                      db.setTransactionSuccessful()
+                      return naoVoltaram
+                  } finally {
+                      db.endTransaction()
+                  }
+              }
+
+              fun excluirMov(id: Long) {
+                  writableDatabase.delete("movimentacoes", "id=?", arrayOf(id.toString()))
+              }
+
+              fun listarProdutos(busca: String = "", somenteBaixo: Boolean = false): List<Produto> {
+                  val r = ArrayList<Produto>()
+                  var sql = "SELECT id, nome, preco_cent, quantidade FROM produtos WHERE nome LIKE ?"
+                  if (somenteBaixo) sql += " AND quantidade <= $LIMITE_BAIXO"
+                  sql += " ORDER BY nome COLLATE NOCASE"
+                  readableDatabase.rawQuery(sql, arrayOf("%" + busca + "%")).use { c ->
+                      while (c.moveToNext()) r.add(Produto(c.getLong(0), c.getString(1), c.getLong(2), c.getInt(3)))
+                  }
+                  return r
+              }
+
+              fun listarVendas(limite: Int): List<VendaResumo> {
+                  val r = ArrayList<VendaResumo>()
+                  val db = readableDatabase
+                  db.rawQuery("SELECT id, data, total_cent, pagamento FROM vendas ORDER BY id DESC LIMIT ?", arrayOf(limite.toString())).use { c ->
+                      while (c.moveToNext()) {
+                          val id = c.getLong(0)
+                          val partes = ArrayList<String>()
+                          db.rawQuery("SELECT quantidade, nome FROM itens_venda WHERE venda_id=? ORDER BY id", arrayOf(id.toString())).use { ci ->
+                              while (ci.moveToNext()) partes.add("${ci.getInt(0)}x ${ci.getString(1)}")
+                          }
+                          r.add(VendaResumo(id, c.getLong(1), c.getLong(2), partes.joinToString(", "), c.getString(3) ?: "Dinheiro"))
+                      }
+                  }
+                  return r
+              }
+
+              fun listarMov(limite: Int): List<Mov> {
+                  val r = ArrayList<Mov>()
+                  readableDatabase.rawQuery("SELECT id, nome, tipo, quantidade, data, obs FROM movimentacoes ORDER BY id DESC LIMIT ?", arrayOf(limite.toString())).use { c ->
+                      while (c.moveToNext()) r.add(Mov(c.getLong(0), c.getString(1), c.getString(2), c.getInt(3), c.getLong(4), c.getString(5)))
+                  }
+                  return r
+              }
+          }
+
+          // ====================== BACKUP (JSON) ======================
+          object Backup {
+              const val FORMATO = "estoque-vendas-backup"
+              const val VERSAO = 2L
+
+              private fun ler(sql: SQLiteDatabase, tabela: String, mapa: List<Pair<String, String>>): JSONArray {
+                  val arr = JSONArray()
+                  val cols = mapa.joinToString(",") { it.first }
+                  sql.rawQuery("SELECT $cols FROM $tabela ORDER BY id", null).use { c ->
+                      while (c.moveToNext()) {
+                          val o = JSONObject()
+                          mapa.forEachIndexed { i, par ->
+                              if (c.getType(i) == Cursor.FIELD_TYPE_INTEGER) o.put(par.second, c.getLong(i))
+                              else o.put(par.second, c.getString(i) ?: "")
+                          }
+                          arr.put(o)
+                      }
+                  }
+                  return arr
+              }
+
+              fun exportar(db: Db): String {
+                  val sql = db.readableDatabase
+                  val raiz = JSONObject()
+                  raiz.put("formato", FORMATO)
+                  raiz.put("versao", VERSAO)
+                  raiz.put("exportadoEm", System.currentTimeMillis())
+                  raiz.put("produtos", ler(sql, "produtos", listOf("id" to "id", "nome" to "nome", "preco_cent" to "precoCent", "quantidade" to "quantidade")))
+                  raiz.put("vendas", ler(sql, "vendas", listOf("id" to "id", "data" to "data", "total_cent" to "totalCent", "pagamento" to "pagamento")))
+                  raiz.put("itensVenda", ler(sql, "itens_venda", listOf("id" to "id", "venda_id" to "vendaId", "produto_id" to "produtoId", "nome" to "nome", "quantidade" to "quantidade", "preco_cent" to "precoCent")))
+                  raiz.put("movimentacoes", ler(sql, "movimentacoes", listOf("id" to "id", "produto_id" to "produtoId", "nome" to "nome", "tipo" to "tipo", "quantidade" to "quantidade", "data" to "data", "obs" to "obs")))
+                  return raiz.toString(2)
+              }
+
+              private fun inteiro(o: JSONObject, k: String, ctx: String, min: Long = 0L): Long {
+                  if (!o.has(k) || o.isNull(k)) throw BackupException("$ctx: o campo \"$k\" está ausente.")
+                  val v = o.get(k)
+                  if (v !is Int && v !is Long) throw BackupException("$ctx: o campo \"$k\" deve ser um número inteiro.")
+                  val n = (v as Number).toLong()
+                  if (n < min) throw BackupException("$ctx: o campo \"$k\" tem valor inválido ($n).")
+                  return n
+              }
+
+              private fun texto(o: JSONObject, k: String, ctx: String, obrigatorio: Boolean = true): String {
+                  if (!o.has(k) || o.isNull(k)) throw BackupException("$ctx: o campo \"$k\" está ausente.")
+                  val v = o.get(k)
+                  if (v !is String) throw BackupException("$ctx: o campo \"$k\" deve ser texto.")
+                  if (obrigatorio && v.isBlank()) throw BackupException("$ctx: o campo \"$k\" está vazio.")
+                  return v
+              }
+
+              private fun objetos(raiz: JSONObject, chave: String): List<JSONObject> {
+                  val arr = raiz.optJSONArray(chave) ?: throw BackupException("A seção \"$chave\" não foi encontrada no arquivo.")
+                  val r = ArrayList<JSONObject>()
+                  for (i in 0 until arr.length()) {
+                      r.add(arr.optJSONObject(i) ?: throw BackupException("Seção \"$chave\", item ${i + 1}: formato inválido."))
+                  }
+                  return r
+              }
+
+              // Valida TUDO antes de qualquer alteração no banco
+              fun validar(conteudo: String): Dados {
+                  val raiz = try {
+                      JSONObject(conteudo.trimStart('\uFEFF').trim())
+                  } catch (e: JSONException) {
+                      throw BackupException("O arquivo escolhido não é um backup válido (não foi possível ler o JSON).")
+                  }
+                  if (raiz.optString("formato") != FORMATO) throw BackupException("Este arquivo não é um backup do aplicativo Estoque e Vendas.")
+                  val versao = inteiro(raiz, "versao", "Cabeçalho", 1L)
+                  if (versao > VERSAO) throw BackupException("Este backup foi criado por uma versão mais nova do aplicativo. Atualize o app e tente novamente.")
+                  val exportadoEm = inteiro(raiz, "exportadoEm", "Cabeçalho")
+
+                  val produtos = objetos(raiz, "produtos")
+                  val vendas = objetos(raiz, "vendas")
+                  val itens = objetos(raiz, "itensVenda")
+                  val movs = objetos(raiz, "movimentacoes")
+
+                  val idsProd = HashSet<Long>()
+                  for ((i, o) in produtos.withIndex()) {
+                      val ctx = "Produto ${i + 1}"
+                      if (!idsProd.add(inteiro(o, "id", ctx, 1L))) throw BackupException("$ctx: código repetido.")
+                      texto(o, "nome", ctx)
+                      inteiro(o, "precoCent", ctx)
+                      if (inteiro(o, "quantidade", ctx) > Int.MAX_VALUE) throw BackupException("$ctx: quantidade grande demais.")
+                  }
+                  val idsVenda = HashSet<Long>()
+                  for ((i, o) in vendas.withIndex()) {
+                      val ctx = "Venda ${i + 1}"
+                      if (!idsVenda.add(inteiro(o, "id", ctx, 1L))) throw BackupException("$ctx: código repetido.")
+                      inteiro(o, "data", ctx)
+                      inteiro(o, "totalCent", ctx)
+                      if (o.has("pagamento") && !o.isNull("pagamento")) texto(o, "pagamento", ctx, false)
+                  }
+                  val idsItem = HashSet<Long>()
+                  for ((i, o) in itens.withIndex()) {
+                      val ctx = "Item de venda ${i + 1}"
+                      if (!idsItem.add(inteiro(o, "id", ctx, 1L))) throw BackupException("$ctx: código repetido.")
+                      if (inteiro(o, "vendaId", ctx, 1L) !in idsVenda) throw BackupException("$ctx: refere-se a uma venda que não existe no arquivo.")
+                      inteiro(o, "produtoId", ctx, 1L)
+                      texto(o, "nome", ctx)
+                      if (inteiro(o, "quantidade", ctx, 1L) > Int.MAX_VALUE) throw BackupException("$ctx: quantidade grande demais.")
+                      inteiro(o, "precoCent", ctx)
+                  }
+                  val idsMov = HashSet<Long>()
+                  for ((i, o) in movs.withIndex()) {
+                      val ctx = "Movimentação ${i + 1}"
+                      if (!idsMov.add(inteiro(o, "id", ctx, 1L))) throw BackupException("$ctx: código repetido.")
+                      inteiro(o, "produtoId", ctx, 1L)
+                      texto(o, "nome", ctx)
+                      val tipo = texto(o, "tipo", ctx)
+                      if (tipo != "ENTRADA" && tipo != "VENDA") throw BackupException("$ctx: tipo desconhecido (\"$tipo\").")
+                      if (inteiro(o, "quantidade", ctx, 1L) > Int.MAX_VALUE) throw BackupException("$ctx: quantidade grande demais.")
+                      inteiro(o, "data", ctx)
+                      texto(o, "obs", ctx, false)
+                  }
+                  return Dados(exportadoEm, produtos, vendas, itens, movs)
+              }
+
+              // Substitui os dados dentro de UMA transação. Se algo falhar, tudo volta ao que era.
+              fun restaurar(db: Db, d: Dados) {
+                  val sql = db.writableDatabase
+                  sql.beginTransaction()
+                  try {
+                      for (t in listOf("itens_venda", "movimentacoes", "vendas", "produtos")) sql.delete(t, null, null)
+
+                      for (o in d.produtos) {
+                          val cv = ContentValues()
+                          cv.put("id", o.getLong("id")); cv.put("nome", o.getString("nome"))
+                          cv.put("preco_cent", o.getLong("precoCent")); cv.put("quantidade", o.getInt("quantidade"))
+                          if (sql.insert("produtos", null, cv) == -1L) throw BackupException("Falha ao gravar um produto.")
+                      }
+                      for (o in d.vendas) {
+                          val cv = ContentValues()
+                          cv.put("id", o.getLong("id")); cv.put("data", o.getLong("data")); cv.put("total_cent", o.getLong("totalCent"))
+                          cv.put("pagamento", o.optString("pagamento", "Dinheiro").ifBlank { "Dinheiro" })
+                          if (sql.insert("vendas", null, cv) == -1L) throw BackupException("Falha ao gravar uma venda.")
+                      }
+                      for (o in d.itens) {
+                          val cv = ContentValues()
+                          cv.put("id", o.getLong("id")); cv.put("venda_id", o.getLong("vendaId")); cv.put("produto_id", o.getLong("produtoId"))
+                          cv.put("nome", o.getString("nome")); cv.put("quantidade", o.getInt("quantidade")); cv.put("preco_cent", o.getLong("precoCent"))
+                          if (sql.insert("itens_venda", null, cv) == -1L) throw BackupException("Falha ao gravar um item de venda.")
+                      }
+                      for (o in d.movs) {
+                          val cv = ContentValues()
+                          cv.put("id", o.getLong("id")); cv.put("produto_id", o.getLong("produtoId")); cv.put("nome", o.getString("nome"))
+                          cv.put("tipo", o.getString("tipo")); cv.put("quantidade", o.getInt("quantidade"))
+                          cv.put("data", o.getLong("data")); cv.put("obs", o.getString("obs"))
+                          if (sql.insert("movimentacoes", null, cv) == -1L) throw BackupException("Falha ao gravar uma movimentação.")
+                      }
+                      sql.setTransactionSuccessful()
+                  } finally {
+                      sql.endTransaction()
+                  }
+              }
+          }
+
+          // ====================== TELAS ======================
+          class MainActivity : Activity() {
+
+              private lateinit var db: Db
+              private lateinit var conteudo: FrameLayout
+              private lateinit var titulo: TextView
+              private val abas = ArrayList<TextView>()
+              private val carrinho = LinkedHashMap<Long, Int>()
+              private var pagamento = "Dinheiro"
+              private var filtroBaixo = false
+              private var buscaEst = ""
+              private var filtroMov = "Todas"
+              private var naInicio = true
+              private val REQ_EXPORTAR = 1
+              private val REQ_RESTAURAR = 2
+              private val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
+              private val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
+              private val fmt = SimpleDateFormat("dd/MM/yyyy HH:mm", Locale("pt", "BR"))
+
+              private val VERDE_ESC = Color.parseColor("#0B4A3A")
+              private val VERDE = Color.parseColor("#0E7C4F")
+              private val FUNDO = Color.parseColor("#F2F5F3")
+              private val VERMELHO = Color.parseColor("#C62828")
+              private val CINZA = Color.parseColor("#6B7772")
+              private val TEXTO = Color.parseColor("#1B2420")
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  db = Db(this)
+                  window.statusBarColor = VERDE_ESC
+                  window.navigationBarColor = Color.WHITE
+
+                  val raiz = LinearLayout(this)
+                  raiz.orientation = LinearLayout.VERTICAL
+                  raiz.setBackgroundColor(FUNDO)
+
+                  titulo = TextView(this)
+                  titulo.setTextColor(Color.WHITE)
+                  titulo.textSize = 22f
+                  titulo.setTypeface(null, Typeface.BOLD)
+                  titulo.setBackgroundColor(VERDE_ESC)
+                  titulo.setPadding(dp(20), dp(18), dp(20), dp(18))
+                  raiz.addView(titulo, LinearLayout.LayoutParams(MATCH, WRAP))
+
+                  conteudo = FrameLayout(this)
+                  raiz.addView(conteudo, LinearLayout.LayoutParams(MATCH, 0, 1f))
+
+                  val nav = LinearLayout(this)
+                  nav.orientation = LinearLayout.HORIZONTAL
+                  nav.setBackgroundColor(Color.WHITE)
+                  nav.elevation = dp(8).toFloat()
+                  val nomes = listOf("🏠\nInício", "🛒\nVendas", "📦\nEstoque", "☰\nMais")
+                  val acoes = listOf<() -> Unit>({ telaInicio() }, { telaVendas() }, { telaEstoque() }, { telaMais() })
+                  for ((i, n) in nomes.withIndex()) {
+                      val t = TextView(this)
+                      t.text = n
+                      t.gravity = Gravity.CENTER
+                      t.textSize = 12f
+                      t.setPadding(0, dp(8), 0, dp(8))
+                      t.setOnClickListener { acoes[i]() }
+                      abas.add(t)
+                      nav.addView(t, LinearLayout.LayoutParams(0, WRAP, 1f))
+                  }
+                  raiz.addView(nav, LinearLayout.LayoutParams(MATCH, WRAP))
+                  setContentView(raiz)
+                  telaInicio()
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onBackPressed() {
+                  if (!naInicio) telaInicio() else super.onBackPressed()
+              }
+
+              // ---------- utilidades ----------
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+              private fun moeda(c: Long) = "R$ ${c / 100},${(c % 100).toString().padStart(2, '0')}"
+              private fun data(ms: Long) = fmt.format(Date(ms))
+              private fun toast(m: String) = Toast.makeText(this, m, Toast.LENGTH_LONG).show()
+
+              private fun aviso(t: String, msg: String) {
+                  AlertDialog.Builder(this).setTitle(t).setMessage(msg).setPositiveButton("OK", null).show()
+              }
+
+              private fun fundo(cor: Int, raio: Int = 12, borda: Int = 0): GradientDrawable {
+                  val g = GradientDrawable()
+                  g.setColor(cor)
+                  g.cornerRadius = dp(raio).toFloat()
+                  if (borda != 0) g.setStroke(dp(1), borda)
+                  return g
+              }
+
+              private fun lp(w: Int, h: Int, peso: Float = 0f, m: Int = 4): LinearLayout.LayoutParams {
+                  val p = LinearLayout.LayoutParams(w, h, peso)
+                  p.setMargins(dp(m), dp(m), dp(m), dp(m))
+                  return p
+              }
+
+              // estilo: 0 = verde cheio, 1 = contorno verde, 2 = contorno vermelho
+              private fun botao(txt: String, estilo: Int = 0, acao: () -> Unit): Button {
+                  val b = Button(this)
+                  b.text = txt
+                  b.isAllCaps = false
+                  b.textSize = 14f
+                  b.minWidth = 0
+                  b.minimumWidth = 0
+                  b.minHeight = dp(44)
+                  b.minimumHeight = dp(44)
+                  b.setOnClickListener { acao() }
+                  when (estilo) {
+                      0 -> { b.background = fundo(VERDE, 12); b.setTextColor(Color.WHITE) }
+                      1 -> { b.background = fundo(Color.WHITE, 12, VERDE); b.setTextColor(VERDE) }
+                      else -> { b.background = fundo(Color.WHITE, 12, VERMELHO); b.setTextColor(VERMELHO) }
+                  }
+                  return b
+              }
+
+              private fun texto(txt: String, tam: Float = 16f, negrito: Boolean = false, cor: Int = TEXTO): TextView {
+                  val t = TextView(this)
+                  t.text = txt
+                  t.textSize = tam
+                  t.setTextColor(cor)
+                  t.setPadding(0, dp(3), 0, dp(3))
+                  if (negrito) t.setTypeface(null, Typeface.BOLD)
+                  return t
+              }
+
+              private fun card(): LinearLayout {
+                  val c = LinearLayout(this)
+                  c.orientation = LinearLayout.VERTICAL
+                  c.background = fundo(Color.WHITE, 14)
+                  c.setPadding(dp(14), dp(12), dp(14), dp(12))
+                  val p = LinearLayout.LayoutParams(MATCH, WRAP)
+                  p.setMargins(0, 0, 0, dp(10))
+                  c.layoutParams = p
+                  return c
+              }
+
+              private fun stat(rotulo: String, valor: String): LinearLayout {
+                  val c = card()
+                  c.addView(texto(rotulo, 13f, false, CINZA))
+                  c.addView(texto(valor, 20f, true))
+                  return c
+              }
+
+              private fun linha2(a: View, b: View): LinearLayout {
+                  val h = LinearLayout(this)
+                  h.orientation = LinearLayout.HORIZONTAL
+                  h.addView(a, LinearLayout.LayoutParams(0, WRAP, 1f).also { it.setMargins(0, 0, dp(5), 0) })
+                  h.addView(b, LinearLayout.LayoutParams(0, WRAP, 1f).also { it.setMargins(dp(5), 0, 0, 0) })
+                  return h
+              }
+
+              private fun marcarAba(i: Int) {
+                  for ((k, t) in abas.withIndex()) {
+                      t.setTextColor(if (k == i) VERDE else CINZA)
+                      t.setTypeface(null, if (k == i) Typeface.BOLD else Typeface.NORMAL)
+                  }
+              }
+
+              private fun pagina(t: String, aba: Int): LinearLayout {
+                  naInicio = false
+                  titulo.text = t
+                  marcarAba(aba)
+                  val col = LinearLayout(this)
+                  col.orientation = LinearLayout.VERTICAL
+                  col.setPadding(dp(14), dp(14), dp(14), dp(14))
+                  val sv = ScrollView(this)
+                  sv.addView(col)
+                  conteudo.removeAllViews()
+                  conteudo.addView(sv)
+                  return col
+              }
+
+              private fun campo(dica: String, tipo: Int): EditText {
+                  val e = EditText(this)
+                  e.hint = dica
+                  e.inputType = tipo
+                  e.textSize = 16f
+                  e.background = fundo(Color.WHITE, 10, Color.parseColor("#C9D3CE"))
+                  e.setPadding(dp(12), dp(10), dp(12), dp(10))
+                  return e
+              }
+
+              private fun aoDigitar(e: EditText, f: () -> Unit) {
+                  e.addTextChangedListener(object : TextWatcher {
+                      override fun beforeTextChanged(s: CharSequence?, st: Int, c: Int, a: Int) {}
+                      override fun onTextChanged(s: CharSequence?, st: Int, b: Int, c: Int) {}
+                      override fun afterTextChanged(s: Editable?) { f() }
+                  })
+              }
+
+              private fun caixa(vararg views: View): LinearLayout {
+                  val b = LinearLayout(this)
+                  b.orientation = LinearLayout.VERTICAL
+                  b.setPadding(dp(20), dp(10), dp(20), 0)
+                  for (v in views) b.addView(v, lp(MATCH, WRAP))
+                  return b
+              }
+
+              private fun parsePreco(s: String): Long {
+                  val n = s.trim().replace(',', '.').toBigDecimalOrNull() ?: throw EstoqueException("Preço inválido. Exemplo: 12,50")
+                  if (n < BigDecimal.ZERO) throw EstoqueException("O preço não pode ser negativo.")
+                  return n.multiply(BigDecimal(100)).setScale(0, RoundingMode.HALF_UP).toLong()
+              }
+
+              // ---------- Início ----------
+              private fun telaInicio() {
+                  val col = pagina("Vendas & Estoque", 0)
+                  naInicio = true
+                  val r = db.resumoHoje()
+                  val ticket = if (r[0] > 0) r[1] / r[0] else 0L
+                  col.addView(linha2(stat("Vendas hoje", moeda(r[1])), stat("Qtd. de vendas", r[0].toString())))
+                  col.addView(linha2(stat("Itens em estoque", db.totalItens().toString()), stat("Ticket médio", moeda(ticket))))
+                  val baixo = db.contarBaixo()
+                  if (baixo > 0) {
+                      val c = card()
+                      c.addView(texto("⚠ Estoque baixo: $baixo produto(s) com $LIMITE_BAIXO ou menos unidades. Toque para ver.", 14f, true, VERMELHO))
+                      c.setOnClickListener { filtroBaixo = true; telaEstoque() }
+                      col.addView(c)
+                  }
+                  col.addView(botao("🛒  Nova venda") { telaVenda() }, lp(MATCH, WRAP))
+                  col.addView(botao("+ Novo produto", 1) { dialogNovoProduto() }, lp(MATCH, WRAP))
+              }
+
+              // ---------- Vendas (histórico) ----------
+              private fun telaVendas() {
+                  val col = pagina("Vendas", 1)
+                  val r = db.resumoHoje()
+                  val c = card()
+                  c.addView(texto("Total de hoje", 13f, false, CINZA))
+                  c.addView(texto(moeda(r[1]), 24f, true, VERDE))
+                  c.addView(texto("${r[0]} venda(s)", 14f, false, CINZA))
+                  col.addView(c)
+                  col.addView(botao("+ Nova venda") { telaVenda() }, lp(MATCH, WRAP))
+                  val vendas = db.listarVendas(200)
+                  if (vendas.isEmpty()) col.addView(texto("Nenhuma venda registrada.", 15f, false, CINZA))
+                  for (v in vendas) {
+                      val k = card()
+                      k.addView(texto("Venda nº ${v.id}  •  ${data(v.data)}", 14f, true))
+                      k.addView(texto(v.itens, 14f, false, CINZA))
+                      k.addView(texto("${v.pagamento}  •  ${moeda(v.total)}", 17f, true, VERDE))
+                      k.addView(botao("Excluir venda", 2) { dialogExcluirVenda(v) }, lp(MATCH, WRAP))
+                      col.addView(k)
+                  }
+              }
+
+              private fun dialogExcluirVenda(v: VendaResumo) {
+                  AlertDialog.Builder(this).setTitle("Excluir venda nº ${v.id}?")
+                      .setMessage("Deseja devolver os itens ao estoque?\n\n• Excluir e devolver: o estoque volta ao que era antes da venda.\n• Só o registro: apaga a venda do histórico e não mexe no estoque.")
+                      .setPositiveButton("Excluir e devolver") { _, _ -> excluirVenda(v.id, true) }
+                      .setNeutralButton("Só o registro") { _, _ -> excluirVenda(v.id, false) }
+                      .setNegativeButton("Cancelar", null).show()
+              }
+
+              private fun excluirVenda(id: Long, devolver: Boolean) {
+                  try {
+                      val n = db.excluirVenda(id, devolver)
+                      telaVendas()
+                      val msg = if (!devolver) "Registro apagado. O estoque não foi alterado."
+                      else if (n > 0) "Venda excluída e estoque atualizado. $n item(ns) não voltaram porque o produto já foi excluído."
+                      else "Venda excluída e itens devolvidos ao estoque."
+                      aviso("Venda excluída", msg)
+                  } catch (e: Exception) {
+                      aviso("Erro", "Não foi possível excluir: ${e.message}")
+                  }
+              }
+
+              // ---------- Estoque / Produtos ----------
+              private fun telaEstoque() {
+                  val col = pagina("Estoque", 2)
+                  col.addView(botao("+ Novo produto") { dialogNovoProduto() }, lp(MATCH, WRAP))
+                  val busca = campo("Buscar produto...", InputType.TYPE_CLASS_TEXT)
+                  busca.setText(buscaEst)
+                  col.addView(busca, lp(MATCH, WRAP))
+                  val filtros = LinearLayout(this)
+                  filtros.orientation = LinearLayout.HORIZONTAL
+                  filtros.addView(botao("Todos", if (!filtroBaixo) 0 else 1) { filtroBaixo = false; telaEstoque() }, lp(0, WRAP, 1f, 3))
+                  filtros.addView(botao("Baixo estoque", if (filtroBaixo) 0 else 1) { filtroBaixo = true; telaEstoque() }, lp(0, WRAP, 1f, 3))
+                  col.addView(filtros)
+                  val lista = LinearLayout(this)
+                  lista.orientation = LinearLayout.VERTICAL
+                  col.addView(lista)
+
+                  fun preencher() {
+                      lista.removeAllViews()
+                      val ps = db.listarProdutos(buscaEst.trim(), filtroBaixo)
+                      if (ps.isEmpty()) {
+                          lista.addView(texto(if (buscaEst.isBlank() && !filtroBaixo) "Nenhum produto cadastrado." else "Nenhum produto encontrado.", 15f, false, CINZA))
+                      }
+                      for (p in ps) {
+                          val k = card()
+                          val baixo = p.quantidade <= LIMITE_BAIXO
+                          k.addView(texto(p.nome, 17f, true))
+                          k.addView(texto("${moeda(p.precoCent)}  •  Estoque: ${p.quantidade}" + (if (baixo) "  (baixo)" else ""), 15f, false, if (baixo) VERMELHO else CINZA))
+                          val bs = LinearLayout(this)
+                          bs.orientation = LinearLayout.HORIZONTAL
+                          bs.addView(botao("Repor", 1) { dialogRepor(p) }, lp(0, WRAP, 1f, 2))
+                          bs.addView(botao("Editar", 1) { dialogEditar(p) }, lp(0, WRAP, 1f, 2))
+                          bs.addView(botao("Excluir", 2) { dialogExcluirProduto(p) }, lp(0, WRAP, 1f, 2))
+                          k.addView(bs)
+                          lista.addView(k)
+                      }
+                  }
+                  preencher()
+                  aoDigitar(busca) { buscaEst = busca.text.toString(); preencher() }
+              }
+
+              private fun dialogNovoProduto() {
+                  val nome = campo("Nome do produto", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES)
+                  val preco = campo("Preço (ex.: 12,50)", InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL)
+                  val qtd = campo("Quantidade inicial", InputType.TYPE_CLASS_NUMBER)
+                  val d = AlertDialog.Builder(this).setTitle("Novo produto").setView(caixa(nome, preco, qtd))
+                      .setPositiveButton("Salvar", null).setNegativeButton("Cancelar", null).create()
+                  d.show()
+                  d.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                      try {
+                          val n = nome.text.toString().trim()
+                          if (n.isEmpty()) throw EstoqueException("Informe o nome do produto.")
+                          val p = parsePreco(preco.text.toString())
+                          val q = qtd.text.toString().trim().ifEmpty { "0" }.toIntOrNull() ?: throw EstoqueException("Quantidade inválida.")
+                          db.cadastrarProduto(n, p, q)
+                          d.dismiss()
+                          toast("Produto cadastrado. Estoque atualizado.")
+                          telaEstoque()
+                      } catch (e: EstoqueException) {
+                          toast(e.message ?: "Dados inválidos.")
+                      } catch (e: Exception) {
+                          toast("Erro ao salvar: ${e.message}")
+                      }
+                  }
+              }
+
+              private fun dialogEditar(p: Produto) {
+                  val nome = campo("Nome do produto", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES)
+                  nome.setText(p.nome)
+                  val preco = campo("Preço (ex.: 12,50)", InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL)
+                  preco.setText("${p.precoCent / 100},${(p.precoCent % 100).toString().padStart(2, '0')}")
+                  val d = AlertDialog.Builder(this).setTitle("Editar produto")
+                      .setView(caixa(nome, preco, texto("Vendas antigas mantêm o preço da época.", 13f, false, CINZA)))
+                      .setPositiveButton("Salvar", null).setNegativeButton("Cancelar", null).create()
+                  d.show()
+                  d.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                      try {
+                          db.editarProduto(p.id, nome.text.toString(), parsePreco(preco.text.toString()))
+                          d.dismiss()
+                          toast("Produto atualizado.")
+                          telaEstoque()
+                      } catch (e: EstoqueException) {
+                          toast(e.message ?: "Dados inválidos.")
+                      } catch (e: Exception) {
+                          toast("Erro ao salvar: ${e.message}")
+                      }
+                  }
+              }
+
+              private fun dialogExcluirProduto(p: Produto) {
+                  AlertDialog.Builder(this).setTitle("Excluir \"${p.nome}\"?")
+                      .setMessage("O produto sai do estoque. As vendas e movimentações antigas continuam no histórico.")
+                      .setPositiveButton("Excluir") { _, _ ->
+                          try {
+                              db.excluirProduto(p.id)
+                              carrinho.remove(p.id)
+                              toast("Produto excluído.")
+                              telaEstoque()
+                          } catch (e: Exception) {
+                              aviso("Erro", "Não foi possível excluir: ${e.message}")
+                          }
+                      }
+                      .setNegativeButton("Cancelar", null).show()
+              }
+
+              private fun dialogRepor(p: Produto) {
+                  val qtd = campo("Quantidade que entrou", InputType.TYPE_CLASS_NUMBER)
+                  val d = AlertDialog.Builder(this).setTitle("Repor: ${p.nome}").setView(caixa(qtd))
+                      .setPositiveButton("Adicionar", null).setNegativeButton("Cancelar", null).create()
+                  d.show()
+                  d.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                      try {
+                          val q = qtd.text.toString().trim().toIntOrNull() ?: throw EstoqueException("Quantidade inválida.")
+                          db.reporEstoque(p.id, q)
+                          d.dismiss()
+                          toast("Estoque atualizado.")
+                          telaEstoque()
+                      } catch (e: EstoqueException) {
+                          toast(e.message ?: "Dados inválidos.")
+                      } catch (e: Exception) {
+                          toast("Erro: ${e.message}")
+                      }
+                  }
+              }
+
+              // ---------- Nova venda ----------
+              private fun telaVenda() {
+                  val col = pagina("Nova venda", 1)
+                  pagamento = "Dinheiro"
+                  val busca = campo("Buscar produto...", InputType.TYPE_CLASS_TEXT)
+                  col.addView(busca, lp(MATCH, WRAP))
+                  val todos = db.listarProdutos().filter { it.quantidade > 0 }
+                  carrinho.keys.retainAll(todos.map { it.id }.toSet())
+                  val precos = todos.associate { it.id to it.precoCent }
+                  val lista = LinearLayout(this)
+                  lista.orientation = LinearLayout.VERTICAL
+                  col.addView(lista)
+                  val tvTotal = texto("", 20f, true, VERDE)
+
+                  fun atualizar() {
+                      var t = 0L
+                      var n = 0
+                      for ((id, q) in carrinho) {
+                          t += (precos[id] ?: 0L) * q
+                          n += q
+                      }
+                      tvTotal.text = "$n item(ns)  •  Total: ${moeda(t)}"
+                  }
+
+                  fun preencher() {
+                      lista.removeAllViews()
+                      val termo = busca.text.toString().trim().lowercase(Locale("pt", "BR"))
+                      val ps = todos.filter { it.nome.lowercase(Locale("pt", "BR")).contains(termo) }
+                      if (todos.isEmpty()) lista.addView(texto("Não há produtos com estoque. Cadastre ou reponha na aba Estoque.", 15f, false, CINZA))
+                      else if (ps.isEmpty()) lista.addView(texto("Nenhum produto encontrado.", 15f, false, CINZA))
+                      for (p in ps) {
+                          val k = card()
+                          val linha = LinearLayout(this)
+                          linha.orientation = LinearLayout.HORIZONTAL
+                          linha.gravity = Gravity.CENTER_VERTICAL
+                          val info = LinearLayout(this)
+                          info.orientation = LinearLayout.VERTICAL
+                          info.addView(texto(p.nome, 16f, true))
+                          info.addView(texto("${moeda(p.precoCent)}  •  Estoque: ${p.quantidade}", 14f, false, CINZA))
+                          val tvQ = TextView(this)
+                          tvQ.text = (carrinho[p.id] ?: 0).toString()
+                          tvQ.textSize = 18f
+                          tvQ.setTextColor(TEXTO)
+                          tvQ.gravity = Gravity.CENTER
+                          tvQ.minWidth = dp(32)
+                          val menos = botao("−", 1) {
+                              val a = carrinho[p.id] ?: 0
+                              if (a > 0) {
+                                  if (a == 1) carrinho.remove(p.id) else carrinho[p.id] = a - 1
+                                  tvQ.text = (carrinho[p.id] ?: 0).toString()
+                                  atualizar()
+                              }
+                          }
+                          val mais = botao("+", 0) {
+                              val a = carrinho[p.id] ?: 0
+                              if (a < p.quantidade) {
+                                  carrinho[p.id] = a + 1
+                                  tvQ.text = (carrinho[p.id] ?: 0).toString()
+                                  atualizar()
+                              } else toast("Estoque máximo: ${p.quantidade}")
+                          }
+                          linha.addView(info, LinearLayout.LayoutParams(0, WRAP, 1f))
+                          linha.addView(menos, LinearLayout.LayoutParams(dp(46), dp(46)))
+                          linha.addView(tvQ)
+                          linha.addView(mais, LinearLayout.LayoutParams(dp(46), dp(46)))
+                          k.addView(linha)
+                          lista.addView(k)
+                      }
+                  }
+                  preencher()
+                  aoDigitar(busca) { preencher() }
+
+                  col.addView(texto("Pagamento", 17f, true))
+                  val nomesPag = listOf("Dinheiro", "Cartão", "Pix")
+                  val btnsPag = ArrayList<Button>()
+                  fun marcarPag() {
+                      for ((i, b) in btnsPag.withIndex()) {
+                          val sel = nomesPag[i] == pagamento
+                          b.background = if (sel) fundo(VERDE, 12) else fundo(Color.WHITE, 12, VERDE)
+                          b.setTextColor(if (sel) Color.WHITE else VERDE)
+                      }
+                  }
+                  val linhaPag = LinearLayout(this)
+                  linhaPag.orientation = LinearLayout.HORIZONTAL
+                  for (n in nomesPag) {
+                      val b = botao(n, 1) { pagamento = n; marcarPag() }
+                      btnsPag.add(b)
+                      linhaPag.addView(b, lp(0, WRAP, 1f, 3))
+                  }
+                  col.addView(linhaPag)
+                  marcarPag()
+                  atualizar()
+                  col.addView(tvTotal)
+                  col.addView(botao("✓  Confirmar venda") {
+                      try {
+                          if (carrinho.isEmpty()) throw EstoqueException("Adicione ao menos um item à venda.")
+                          val pg = pagamento
+                          val id = db.registrarVenda(carrinho.toMap(), pg)
+                          carrinho.clear()
+                          telaVenda()
+                          aviso("Venda registrada", "Venda nº $id registrada ($pg). O estoque foi atualizado automaticamente.")
+                      } catch (e: EstoqueException) {
+                          aviso("Não foi possível vender", e.message ?: "Erro desconhecido.")
+                          telaVenda()
+                      } catch (e: Exception) {
+                          aviso("Erro", "Falha ao registrar a venda: ${e.message}")
+                      }
+                  }, lp(MATCH, WRAP))
+              }
+
+              // ---------- Mais ----------
+              private fun linhaMenu(t: String, sub: String, acao: () -> Unit): View {
+                  val c = card()
+                  c.addView(texto(t, 17f, true))
+                  c.addView(texto(sub, 14f, false, CINZA))
+                  c.setOnClickListener { acao() }
+                  return c
+              }
+
+              private fun telaMais() {
+                  val col = pagina("Mais", 3)
+                  col.addView(linhaMenu("Movimentações de estoque", "Entradas e saídas, com opção de excluir registros") { telaMov() })
+                  col.addView(linhaMenu("Configurações e backup", "Exportar e restaurar seus dados") { telaConfig() })
+              }
+
+              // ---------- Movimentações ----------
+              private fun telaMov() {
+                  val col = pagina("Movimentações", 3)
+                  val filtros = LinearLayout(this)
+                  filtros.orientation = LinearLayout.HORIZONTAL
+                  for (f in listOf("Todas", "Entradas", "Saídas")) {
+                      filtros.addView(botao(f, if (filtroMov == f) 0 else 1) { filtroMov = f; telaMov() }, lp(0, WRAP, 1f, 3))
+                  }
+                  col.addView(filtros)
+                  val movs = db.listarMov(300).filter {
+                      when (filtroMov) {
+                          "Entradas" -> it.tipo == "ENTRADA"
+                          "Saídas" -> it.tipo == "VENDA"
+                          else -> true
+                      }
+                  }
+                  if (movs.isEmpty()) col.addView(texto("Nenhuma movimentação.", 15f, false, CINZA))
+                  for (m in movs) {
+                      val saida = m.tipo == "VENDA"
+                      val k = card()
+                      k.addView(texto((if (saida) "↓ Saída −" else "↑ Entrada +") + "${m.qtd} un", 16f, true, if (saida) VERMELHO else VERDE))
+                      k.addView(texto(m.nome, 16f, true))
+                      k.addView(texto("${data(m.data)}  •  ${m.obs}", 13f, false, CINZA))
+                      k.addView(botao("Excluir registro", 2) { dialogExcluirMov(m) }, lp(MATCH, WRAP))
+                      col.addView(k)
+                  }
+              }
+
+              private fun dialogExcluirMov(m: Mov) {
+                  AlertDialog.Builder(this).setTitle("Excluir registro?")
+                      .setMessage("Isto apaga somente este registro do histórico. A quantidade em estoque NÃO muda.")
+                      .setPositiveButton("Excluir") { _, _ ->
+                          try {
+                              db.excluirMov(m.id)
+                              telaMov()
+                          } catch (e: Exception) {
+                              aviso("Erro", "Não foi possível excluir: ${e.message}")
+                          }
+                      }
+                      .setNegativeButton("Cancelar", null).show()
+              }
+
+              // ---------- Configurações / Backup ----------
+              private fun telaConfig() {
+                  val col = pagina("Configurações", 3)
+                  val c = card()
+                  c.addView(texto("Todos os dados ficam somente neste aparelho. O backup é um arquivo JSON sem senha: guarde-o em local seguro.", 15f, false, CINZA))
+                  col.addView(c)
+                  col.addView(botao("Exportar backup") { exportar() }, lp(MATCH, WRAP))
+                  col.addView(botao("Restaurar backup", 1) { restaurar() }, lp(MATCH, WRAP))
+              }
+
+              private fun exportar() {
+                  val i = Intent(Intent.ACTION_CREATE_DOCUMENT)
+                  i.addCategory(Intent.CATEGORY_OPENABLE)
+                  i.type = "application/json"
+                  i.putExtra(Intent.EXTRA_TITLE, "backup-estoque-" + SimpleDateFormat("yyyyMMdd-HHmm", Locale.US).format(Date()) + ".json")
+                  try {
+                      startActivityForResult(i, REQ_EXPORTAR)
+                  } catch (e: Exception) {
+                      aviso("Erro", "Não foi possível abrir o seletor de arquivos deste aparelho.")
+                  }
+              }
+
+              private fun restaurar() {
+                  val i = Intent(Intent.ACTION_OPEN_DOCUMENT)
+                  i.addCategory(Intent.CATEGORY_OPENABLE)
+                  i.type = "*/*"
+                  try {
+                      startActivityForResult(i, REQ_RESTAURAR)
+                  } catch (e: Exception) {
+                      aviso("Erro", "Não foi possível abrir o seletor de arquivos deste aparelho.")
+                  }
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, resultData: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, resultData)
+                  val uri = resultData?.data
+                  if (resultCode != RESULT_OK || uri == null) return
+                  if (requestCode == REQ_EXPORTAR) gravarBackup(uri)
+                  if (requestCode == REQ_RESTAURAR) lerBackup(uri)
+              }
+
+              private fun gravarBackup(uri: Uri) {
+                  try {
+                      val json = Backup.exportar(db)
+                      val saida = contentResolver.openOutputStream(uri, "wt") ?: throw Exception("Não foi possível abrir o arquivo para escrita.")
+                      saida.use { it.write(json.toByteArray(Charsets.UTF_8)) }
+                      val lido = contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
+                          ?: throw Exception("Não foi possível reler o arquivo salvo.")
+                      val d = Backup.validar(lido)
+                      aviso("Backup exportado", "Backup salvo e conferido com sucesso.\n\n${d.produtos.size} produtos\n${d.vendas.size} vendas\n${d.movs.size} movimentações")
+                  } catch (e: BackupException) {
+                      aviso("Backup com problema", "O arquivo foi gravado, mas não passou na conferência: ${e.message}\nTente exportar novamente.")
+                  } catch (e: Exception) {
+                      aviso("Falha ao exportar", "Não foi possível salvar o backup: ${e.message}")
+                  }
+              }
+
+              private fun lerBackup(uri: Uri) {
+                  val dados: Dados
+                  try {
+                      val txt = contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
+                          ?: throw Exception("Não foi possível abrir o arquivo.")
+                      dados = Backup.validar(txt)
+                  } catch (e: BackupException) {
+                      aviso("Arquivo inválido", "${e.message}\n\nNenhum dado foi alterado.")
+                      return
+                  } catch (e: Exception) {
+                      aviso("Erro ao ler o arquivo", "${e.message}\n\nNenhum dado foi alterado.")
+                      return
+                  }
+                  val msg = "Backup de ${data(dados.exportadoEm)}:\n" +
+                      "• ${dados.produtos.size} produtos\n• ${dados.vendas.size} vendas\n• ${dados.movs.size} movimentações\n\n" +
+                      "Dados atuais neste aparelho:\n" +
+                      "• ${db.contar("produtos")} produtos\n• ${db.contar("vendas")} vendas\n• ${db.contar("movimentacoes")} movimentações\n\n" +
+                      "ATENÇÃO: todos os dados atuais serão substituídos pelos do backup. Isso não pode ser desfeito."
+                  AlertDialog.Builder(this).setTitle("Restaurar backup?").setMessage(msg)
+                      .setPositiveButton("Substituir dados") { _, _ -> executarRestauracao(dados) }
+                      .setNegativeButton("Cancelar", null).show()
+              }
+
+              private fun executarRestauracao(dados: Dados) {
+                  try {
+                      Backup.restaurar(db, dados)
+                      carrinho.clear()
+                      telaInicio()
+                      aviso("Restauração concluída", "Dados restaurados:\n• ${db.contar("produtos")} produtos\n• ${db.contar("vendas")} vendas\n• ${db.contar("movimentacoes")} movimentações")
+                  } catch (e: Exception) {
+                      aviso("Falha na restauração", "Não foi possível restaurar: ${e.message}\n\nSeus dados atuais foram mantidos.")
+                  }
+              }
+          }
+          EOF
+      - name: Criar icone do app
+        run: |
+          mkdir -p app/src/main/res/mipmap-anydpi-v26 app/src/main/res/mipmap-anydpi app/src/main/res/drawable app/src/main/res/values
+
+          cat > app/src/main/res/values/ic_colors.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="ic_bg">#12307A</color>
+          </resources>
+          EOF
+
+          cat > app/src/main/res/drawable/ic_fg.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+              <path android:fillColor="#2F7BF5" android:pathData="M57,30 L83,30 Q86,30 86,33 L86,60 Q86,63 83,63 L57,63 Q54,63 54,60 L54,33 Q54,30 57,30 Z"/>
+              <path android:fillColor="#F2F6FF" android:pathData="M58,34 L82,34 L82,60 L58,60 Z"/>
+              <path android:fillColor="#2F7BF5" android:pathData="M63,25 Q63,22 66,22 L74,22 Q77,22 77,25 L77,31 L63,31 Z"/>
+              <path android:fillColor="#12307A" android:pathData="M68.5,26 a1.5,1.5 0 1,0 3,0 a1.5,1.5 0 1,0 -3,0"/>
+              <path android:strokeColor="#2ECC71" android:strokeWidth="2" android:strokeLineCap="round" android:strokeLineJoin="round" android:pathData="M61,41 L63,43 L67,39"/>
+              <path android:strokeColor="#2ECC71" android:strokeWidth="2" android:strokeLineCap="round" android:strokeLineJoin="round" android:pathData="M61,50 L63,52 L67,48"/>
+              <path android:strokeColor="#12307A" android:strokeWidth="1.8" android:strokeLineCap="round" android:pathData="M70,41 L79,41"/>
+              <path android:strokeColor="#12307A" android:strokeWidth="1.8" android:strokeLineCap="round" android:pathData="M70,50 L79,50"/>
+              <path android:fillColor="#4ADE6B" android:pathData="M35,42 L40,42 L40,54 L35,54 Z"/>
+              <path android:fillColor="#4ADE6B" android:pathData="M43,38 L48,38 L48,54 L43,54 Z"/>
+              <path android:fillColor="#7BE06A" android:pathData="M51,33 L56,33 L56,54 L51,54 Z"/>
+              <path android:strokeColor="#2ECC71" android:strokeWidth="2.5" android:strokeLineCap="round" android:pathData="M32,40 Q45,36 53,27"/>
+              <path android:fillColor="#2ECC71" android:pathData="M47,25 L57,22 L55.5,32 Z"/>
+              <path android:fillColor="#FFFFFF" android:pathData="M31,52 L65,53 Q67,53 66.5,55 L62,68 Q61.5,70 59.5,70 L40,70.5 Z"/>
+              <path android:strokeColor="#FFFFFF" android:strokeWidth="3.5" android:strokeLineCap="round" android:strokeLineJoin="round" android:pathData="M23,47 L29,47 L39.5,73 L58,73"/>
+              <path android:fillColor="#FFFFFF" android:pathData="M37,80 a4,4 0 1,0 8,0 a4,4 0 1,0 -8,0"/>
+              <path android:fillColor="#FFFFFF" android:pathData="M53,80 a4,4 0 1,0 8,0 a4,4 0 1,0 -8,0"/>
+              <path android:fillColor="#FDB92E" android:pathData="M62,64 L75,58 L87,63 L74,69 Z"/>
+              <path android:fillColor="#E0730C" android:pathData="M62,64 L74,69 L74,84 L62,78 Z"/>
+              <path android:fillColor="#F59A1B" android:pathData="M74,69 L87,63 L87,78 L74,84 Z"/>
+              <path android:fillColor="#B85A0E" android:pathData="M69,62 L75,59.5 L79,61.2 L73,64 Z"/>
+          </vector>
+          EOF
+
+          cat > app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_bg"/>
+              <foreground android:drawable="@drawable/ic_fg"/>
+          </adaptive-icon>
+          EOF
+
+          cat > app/src/main/res/mipmap-anydpi/ic_launcher.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+              <item>
+                  <shape android:shape="rectangle">
+                      <solid android:color="@color/ic_bg"/>
+                      <corners android:radius="12dp"/>
+                  </shape>
+              </item>
+              <item android:drawable="@drawable/ic_fg"/>
+          </layer-list>
+          EOF
+      - name: Compilar
+        run: gradle assembleDebug --no-daemon
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: APK ${{ github.run_number }}
+          files: app/build/outputs/apk/debug/app-debug.apk
